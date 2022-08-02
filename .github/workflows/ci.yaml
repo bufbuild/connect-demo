@@ -1,73 +1,52 @@
 name: ci
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
-    branches: [main]
-  schedule:
-    - cron: '15 22 * * *'
-  workflow_dispatch: {} # support manual runs
-# Prevent writing to the repository using the CI token.
-# Ref: https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#permissions
-permissions: read-all
+    types:
+      - opened
+      - synchronize
+      - reopened
 env:
-  SERVICE: connect-demo
-  REGISTRY: connect-demo
-  REGION: us-central1
+  MAKEFLAGS: "-j 8"
+  PRIVATE_REGISTRY_HOST: us.gcr.io
+  PRIVATE_REGISTRY_URL: us.gcr.io/buf-private-gcr-1
+permissions:
+  contents: read
 jobs:
-  ci:
+  testlint:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
+      - name: checkout
         uses: actions/checkout@v3
-        with:
-          fetch-depth: 1
-      - name: Install Go
+      - name: setup-go
         uses: actions/setup-go@v3
         with:
           go-version: 1.18.x
-      - name: Cache
-        uses: actions/cache@v3
-        with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-connect-demo-ci-${{ hashFiles('**/go.sum') }}
-          restore-keys: ${{ runner.os }}-connect-demo-ci-
-      - name: Test
+      - name: make-test
         run: make test && make checkgenerate
-      - name: Lint
+      - name: make-lint
         run: make lint
-      - name: GCP Auth
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        uses: google-github-actions/auth@v0
+  docker-build-push-connect-demo:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs:
+      - testlint
+    steps:
+      - name: setup-docker-buildx
+        uses: docker/setup-buildx-action@v2
+      - name: login-gcr
+        uses: docker/login-action@v2
         with:
-          credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
-      - name: Set up GCP SDK
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        uses: google-github-actions/setup-gcloud@v0
-      - name: Authorize Docker push
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
-      - name: Build and Push Container
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        run: |-
-          docker build -t ${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT }}/${{ env.REGISTRY }}/${{ env.SERVICE }}:${{ github.sha }} .
-          docker push ${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT }}/${{ env.REGISTRY }}/${{ env.SERVICE }}:${{ github.sha }}
-      - name: Deploy to Cloud Run
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        run: |-
-          gcloud run deploy ${{ env.SERVICE }} \
-          --image=${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT }}/${{ env.REGISTRY }}/${{ env.SERVICE }}:${{ github.sha }} \
-          --port=8080 \
-          --concurrency=512 \
-          --cpu=2 \
-          --ingress=all \
-          --max-instances=5 \
-          --min-instances=default \
-          --memory=512Mi \
-          --platform=managed \
-          --timeout=5m \
-          --use-http2 \
-          --allow-unauthenticated \
-          --cpu-throttling \
-          --region=${{ env.REGION }} \
-          --quiet
+          registry: ${{ env.PRIVATE_REGISTRY_HOST }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.PRIVATE_DOCKER_TOKEN }}
+      - name: build-push
+        uses: docker/build-push-action@v3
+        with:
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ env.PRIVATE_REGISTRY_URL }}/connect-demo:latest
+            ${{ env.PRIVATE_REGISTRY_URL }}/connect-demo:${{ github.sha }}
